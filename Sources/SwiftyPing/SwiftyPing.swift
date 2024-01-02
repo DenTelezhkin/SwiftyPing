@@ -162,7 +162,15 @@ public class SwiftyPing: NSObject {
         return trueSequenceIndex
     }
     /// Array of all ping responses sent to the `observer`.
-    public private(set) var responses: [PingResponse] = []
+    private var _responses: [PingResponse] = []
+    public private(set) var responses: [PingResponse] {
+        get {
+            _serial_property.sync { self._responses }
+        }
+        set {
+            _serial_property.sync { self._responses = newValue }
+        }
+    }
     /// A random identifier which is a part of the ping request.
     private let identifier = UInt16.random(in: 0..<UInt16.max)
     /// A random UUID fingerprint sent as the payload.
