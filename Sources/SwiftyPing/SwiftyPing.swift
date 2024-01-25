@@ -97,23 +97,48 @@ public class SwiftyPing: NSObject {
     public struct Destination {
         /// The host name, can be a IP address or a URL.
         public let host: String
-        /// IPv4 address of the host.
-        public let ipv4Address: Data
-        /// Socket address of `ipv4Address`.
-        public var socketAddress: sockaddr_in? { return ipv4Address.socketAddressInternet }
         /// IP address of the host.
+        public let ipAddress: Data
+        
+        public let ipAddressFamily: Int32
+        
+        /// Socket address of `ipAddress`.
+        public var socketAddressIPv4: sockaddr_in { return ipAddress.socketAddressIPv4 }
+        public var socketAddressIPv6: sockaddr_in6 { return ipAddress.socketAddressIPv6 }
+        /// IP address of the host.
+        
         public var ip: String? {
-            guard let address = socketAddress else { return nil }
+            if ipAddressFamily == AF_INET {
+                ipV4
+            } else {
+                ipV6
+            }
+        }
+        
+        private var ipV4: String? {
+            let address = socketAddressIPv4
             return String(cString: inet_ntoa(address.sin_addr), encoding: .ascii)
+        }
+        private var ipV6: String? {
+            var address = ipAddress.socketAddressIPv6
+            let length = Int(INET6_ADDRSTRLEN)
+            var buffer = [CChar](repeating: 0, count: length)
+            
+            let hostCString = withUnsafePointer(to: &address.sin6_addr) {
+              inet_ntop(AF_INET6, $0, &buffer, socklen_t(length))
+            }
+            guard let hostCString else { return nil }
+            return String(cString: hostCString)
         }
         
         /// Resolves the `host`.
-        public static func getIPv4AddressFromHost(host: String) throws -> Data {
+        public static func getIPAddressFromHost(host: String) throws -> (Data, Int32) {
             var streamError = CFStreamError()
             let cfhost = CFHostCreateWithName(nil, host as CFString).takeRetainedValue()
             let status = CFHostStartInfoResolution(cfhost, .addresses, &streamError)
             
             var data: Data?
+            var ipAddressFamily: Int32?
             if !status {
                 if Int32(streamError.domain) == kCFStreamErrorDomainNetDB {
                     throw PingError.addressLookupError
@@ -128,8 +153,15 @@ public class SwiftyPing: NSObject {
                 
                 for address in addresses {
                     let addrin = address.socketAddress
-                    if address.count >= MemoryLayout<sockaddr>.size && addrin.sa_family == UInt8(AF_INET) {
+                    if address.count >= MemoryLayout<sockaddr>.size {
                         data = address
+                        switch addrin.sa_family {
+                        case UInt8(AF_INET):
+                            ipAddressFamily = AF_INET
+                        case UInt8(AF_INET6):
+                            ipAddressFamily = AF_INET6
+                        default: ()
+                        }
                         break
                     }
                 }
@@ -138,8 +170,8 @@ public class SwiftyPing: NSObject {
                     throw PingError.hostNotFound
                 }
             }
-            guard let returnData = data else { throw PingError.unknownHostError }
-            return returnData
+            guard let returnData = data, let ipAddressFamily else { throw PingError.unknownHostError }
+            return (returnData, ipAddressFamily)
         }
 
     }
@@ -253,7 +285,7 @@ public class SwiftyPing: NSObject {
 
     // MARK: - Convenience Initializers
     /// Initializes a pinger from an IPv4 address string.
-    /// - Parameter ipv4Address: The host's IP address.
+    /// - Parameter ipAddress: The host's IP address.
     /// - Parameter configuration: A configuration object which can be used to customize pinging behavior.
     /// - Parameter queue: All responses are delivered through this dispatch queue.
     public convenience init(ipv4Address: String, config configuration: PingConfiguration, queue: DispatchQueue) throws {
@@ -265,7 +297,7 @@ public class SwiftyPing: NSObject {
         socketAddress.sin_addr.s_addr = inet_addr(ipv4Address.cString(using: .utf8))
         let data = Data(bytes: &socketAddress, count: MemoryLayout<sockaddr_in>.size)
         
-        let destination = Destination(host: ipv4Address, ipv4Address: data)
+        let destination = Destination(host: ipv4Address, ipAddress: data, ipAddressFamily: AF_INET)
         try self.init(destination: destination, configuration: configuration, queue: queue)
     }
     /// Initializes a pinger from a given host string.
@@ -274,8 +306,8 @@ public class SwiftyPing: NSObject {
     /// - Parameter queue: All responses are delivered through this dispatch queue.
     /// - Throws: A `PingError` if the given host could not be resolved.
     public convenience init(host: String, configuration: PingConfiguration, queue: DispatchQueue) throws {
-        let result = try Destination.getIPv4AddressFromHost(host: host)
-        let destination = Destination(host: host, ipv4Address: result)
+        let result = try Destination.getIPAddressFromHost(host: host)
+        let destination = Destination(host: host, ipAddress: result.0, ipAddressFamily: result.1)
         try self.init(destination: destination, configuration: configuration, queue: queue)
     }
     
@@ -289,7 +321,8 @@ public class SwiftyPing: NSObject {
             var context = CFSocketContext(version: 0, info: unmanagedSocketInfo!.toOpaque(), retain: nil, release: nil, copyDescription: nil)
 
             // ...and a socket...
-            socket = CFSocketCreate(kCFAllocatorDefault, AF_INET, SOCK_DGRAM, IPPROTO_ICMP, CFSocketCallBackType.dataCallBack.rawValue, { socket, type, address, data, info in
+            let icmpProtocol = destination.ipAddressFamily == AF_INET ? IPPROTO_ICMP : IPPROTO_ICMPV6
+            socket = CFSocketCreate(kCFAllocatorDefault, destination.ipAddressFamily, SOCK_DGRAM, icmpProtocol, CFSocketCallBackType.dataCallBack.rawValue, { socket, type, address, data, info in
                 // Socket callback closure
                 guard let socket = socket, let info = info, let data = data else { return }
                 let socketInfo = Unmanaged<SocketInfo>.fromOpaque(info).takeUnretainedValue()
@@ -310,7 +343,8 @@ public class SwiftyPing: NSObject {
             
             // Set TTL
             if var ttl = configuration.timeToLive {
-                let err = setsockopt(handle, IPPROTO_IP, IP_TTL, &ttl, socklen_t(MemoryLayout.size(ofValue: ttl)))
+                let protoIP = destination.ipAddressFamily == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP
+                let err = setsockopt(handle, protoIP, IP_TTL, &ttl, socklen_t(MemoryLayout.size(ofValue: ttl)))
                 guard err == 0 else {
                     throw PingError.socketOptionsSetError(err: err)
                 }
@@ -375,11 +409,13 @@ public class SwiftyPing: NSObject {
         self.timeoutTimer = timer
 
         _serial.async {
-            let address = self.destination.ipv4Address
+            let address = self.destination.ipAddress
             do {
-                let icmpPackage = try self.createICMPPackage(identifier: UInt16(self.identifier), sequenceNumber: UInt16(self.sequenceIndex))
+                let echoType = self.destination.ipAddressFamily == AF_INET6 ? ICMPType.EchoRequestV6 : ICMPType.EchoRequest
+                let icmpPackage = try self.createICMPPackage(type: echoType, identifier: UInt16(self.identifier), sequenceNumber: UInt16(self.sequenceIndex))
                 
                 guard let socket = self.socket else { return }
+                
                 let socketError = CFSocketSendData(socket, address as CFData, icmpPackage as CFData, self.configuration.timeoutInterval)
 
                 if socketError != .success {
@@ -576,7 +612,9 @@ public class SwiftyPing: NSObject {
         
         do {
             let validation = try validateResponse(from: data)
-            if !validation { return }
+            if !validation {
+                return
+            }
         } catch let error as PingError {
             validationError = error
         } catch {
@@ -585,7 +623,8 @@ public class SwiftyPing: NSObject {
         
         timeoutTimer?.invalidate()
         var ipHeader: IPHeader? = nil
-        if validationError == nil {
+        if validationError == nil, destination.ipAddressFamily == AF_INET {
+            // Load only IPv4 header for now.
             ipHeader = data.withUnsafeBytes({ $0.load(as: IPHeader.self) })
         }
         let response = PingResponse(identifier: identifier,
@@ -606,8 +645,8 @@ public class SwiftyPing: NSObject {
     // MARK: - ICMP package
     
     /// Creates an ICMP package.
-    private func createICMPPackage(identifier: UInt16, sequenceNumber: UInt16) throws -> Data {
-        var header = ICMPHeader(type: ICMPType.EchoRequest.rawValue,
+    private func createICMPPackage(type: ICMPType, identifier: UInt16, sequenceNumber: UInt16) throws -> Data {
+        var header = ICMPHeader(type: type.rawValue,
                                 code: 0,
                                 checksum: 0,
                                 identifier: CFSwapInt16HostToBig(identifier),
@@ -620,8 +659,10 @@ public class SwiftyPing: NSObject {
             additional = (0..<delta).map { _ in UInt8.random(in: UInt8.min...UInt8.max) }
         }
 
-        let checksum = try computeChecksum(header: header, additionalPayload: additional)
-        header.checksum = checksum
+        if type == .EchoRequest {
+            let checksum = try computeChecksum(header: header, additionalPayload: additional)
+            header.checksum = checksum
+        }
         
         let package = Data(bytes: &header, count: MemoryLayout<ICMPHeader>.size) + Data(additional)
         return package
@@ -669,44 +710,73 @@ public class SwiftyPing: NSObject {
     }
     
     private func validateResponse(from data: Data) throws -> Bool {
-        guard data.count >= MemoryLayout<ICMPHeader>.size + MemoryLayout<IPHeader>.size else {
-            throw PingError.invalidLength(received: data.count)
-        }
-                
-        guard let headerOffset = icmpHeaderOffset(of: data) else { throw PingError.invalidHeaderOffset }
-        let payloadSize = data.count - headerOffset - MemoryLayout<ICMPHeader>.size
-        let icmpHeader = data.withUnsafeBytes({ $0.load(fromByteOffset: headerOffset, as: ICMPHeader.self) })
-        let payload = data.subdata(in: (data.count - payloadSize)..<data.count)
-        
-        let uuid = UUID(uuid: icmpHeader.payload)
-        guard uuid == fingerprint else {
-            // Wrong handler, ignore this response
-            return false
-        }
-
-        let checksum = try computeChecksum(header: icmpHeader, additionalPayload: [UInt8](payload))
-        
-        guard icmpHeader.checksum == checksum else {
-            throw PingError.checksumMismatch(received: icmpHeader.checksum, calculated: checksum)
-        }
-        guard icmpHeader.type == ICMPType.EchoReply.rawValue else {
-            throw PingError.invalidType(received: icmpHeader.type)
-        }
-        guard icmpHeader.code == 0 else {
-            throw PingError.invalidCode(received: icmpHeader.code)
-        }
-        guard CFSwapInt16BigToHost(icmpHeader.identifier) == identifier else {
-            throw PingError.identifierMismatch(received: icmpHeader.identifier, expected: identifier)
-        }
-        let receivedSequenceIndex = CFSwapInt16BigToHost(icmpHeader.sequenceNumber)
-        guard receivedSequenceIndex == sequenceIndex else {
-            if erroredIndices.contains(Int(receivedSequenceIndex)) {
-                // This response either errorred or timed out, ignore it
+        if destination.ipAddressFamily == AF_INET6 {
+            guard data.count >= MemoryLayout<ICMPHeader>.size else {
+                throw PingError.invalidLength(received: data.count)
+            }
+            let icmpHeader = data.withUnsafeBytes({ $0.load(fromByteOffset: 0, as: ICMPHeader.self) })
+            let uuid = UUID(uuid: icmpHeader.payload)
+            guard uuid == fingerprint else {
+                // Wrong handler, ignore this response
                 return false
             }
-            throw PingError.invalidSequenceIndex(received: receivedSequenceIndex, expected: sequenceIndex)
+            guard icmpHeader.type == ICMPType.EchoReplyV6.rawValue else {
+                throw PingError.invalidType(received: icmpHeader.type)
+            }
+            guard icmpHeader.code == 0 else {
+                throw PingError.invalidCode(received: icmpHeader.code)
+            }
+            guard CFSwapInt16BigToHost(icmpHeader.identifier) == identifier else {
+                throw PingError.identifierMismatch(received: icmpHeader.identifier, expected: identifier)
+            }
+            let receivedSequenceIndex = CFSwapInt16BigToHost(icmpHeader.sequenceNumber)
+            guard receivedSequenceIndex == sequenceIndex else {
+                if erroredIndices.contains(Int(receivedSequenceIndex)) {
+                    // This response either errorred or timed out, ignore it
+                    return false
+                }
+                throw PingError.invalidSequenceIndex(received: receivedSequenceIndex, expected: sequenceIndex)
+            }
+            return true
+        } else {
+            guard data.count >= MemoryLayout<ICMPHeader>.size + MemoryLayout<IPHeader>.size else {
+                throw PingError.invalidLength(received: data.count)
+            }
+            guard let headerOffset = icmpHeaderOffset(of: data) else { throw PingError.invalidHeaderOffset }
+            let payloadSize = data.count - headerOffset - MemoryLayout<ICMPHeader>.size
+            let icmpHeader = data.withUnsafeBytes({ $0.load(fromByteOffset: headerOffset, as: ICMPHeader.self) })
+            let payload = data.subdata(in: (data.count - payloadSize)..<data.count)
+            
+            let uuid = UUID(uuid: icmpHeader.payload)
+            guard uuid == fingerprint else {
+                // Wrong handler, ignore this response
+                return false
+            }
+
+            let checksum = try computeChecksum(header: icmpHeader, additionalPayload: [UInt8](payload))
+            
+            guard icmpHeader.checksum == checksum else {
+                throw PingError.checksumMismatch(received: icmpHeader.checksum, calculated: checksum)
+            }
+            guard icmpHeader.type == ICMPType.EchoReply.rawValue else {
+                throw PingError.invalidType(received: icmpHeader.type)
+            }
+            guard icmpHeader.code == 0 else {
+                throw PingError.invalidCode(received: icmpHeader.code)
+            }
+            guard CFSwapInt16BigToHost(icmpHeader.identifier) == identifier else {
+                throw PingError.identifierMismatch(received: icmpHeader.identifier, expected: identifier)
+            }
+            let receivedSequenceIndex = CFSwapInt16BigToHost(icmpHeader.sequenceNumber)
+            guard receivedSequenceIndex == sequenceIndex else {
+                if erroredIndices.contains(Int(receivedSequenceIndex)) {
+                    // This response either errorred or timed out, ignore it
+                    return false
+                }
+                throw PingError.invalidSequenceIndex(received: receivedSequenceIndex, expected: sequenceIndex)
+            }
+            return true
         }
-        return true
     }
 
 }
@@ -747,6 +817,9 @@ private struct ICMPHeader {
 public enum ICMPType: UInt8 {
     case EchoReply = 0
     case EchoRequest = 8
+    
+    case EchoRequestV6 = 128
+    case EchoReplyV6 = 129
 }
 
 // MARK: - Helpers
@@ -839,7 +912,11 @@ public extension Data {
         return withUnsafeBytes { $0.load(as: sockaddr.self) }
     }
     /// Expresses a chunk of data as an internet-style socket address.
-    var socketAddressInternet: sockaddr_in {
+    var socketAddressIPv4: sockaddr_in {
         return withUnsafeBytes { $0.load(as: sockaddr_in.self) }
+    }
+    
+    var socketAddressIPv6: sockaddr_in6 {
+        return withUnsafeBytes { $0.load(as: sockaddr_in6.self) }
     }
 }
