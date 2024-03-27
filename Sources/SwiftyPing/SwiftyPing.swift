@@ -240,7 +240,15 @@ public class SwiftyPing: NSObject {
         }
     }
     
-    private var erroredIndices = [Int]()
+    private var _erroredIndices = [Int]()
+    private var erroredIndices: [Int] {
+        get {
+            _serial_property.sync { self._erroredIndices }
+        }
+        set {
+            _serial_property.sync { self._erroredIndices = newValue }
+        }
+    }
     /// Initializes a pinger.
     /// - Parameter destination: Specifies the host.
     /// - Parameter configuration: A configuration object which can be used to customize pinging behavior.
